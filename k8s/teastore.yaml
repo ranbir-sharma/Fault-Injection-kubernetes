@@ -1,0 +1,32 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: teastore
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teastore-recommender
+  namespace: teastore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: teastore-recommender
+  template:
+    metadata:
+      labels:
+        app: teastore-recommender
+    spec:
+      containers:
+      - name: recommender
+        image: descartesresearch/teastore-recommender
+        ports:
+        - containerPort: 8080
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"

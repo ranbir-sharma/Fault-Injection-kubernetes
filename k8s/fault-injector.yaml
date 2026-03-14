@@ -1,0 +1,21 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fault-injector
+  namespace: teastore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fault-injector
+  template:
+    metadata:
+      labels:
+        app: fault-injector
+    spec:
+      containers:
+      - name: fault-injector
+        image: python:3.10
+        command: ["python", "/app/metric_fault_injector.py"]
+        ports:
+        - containerPort: 5001
