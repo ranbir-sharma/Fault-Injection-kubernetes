@@ -1,15 +1,39 @@
 # Kubernetes Fault Injection Experiment Guide
 
-This project is a local Kubernetes autoscaling fault-injection testbed. It is designed for Docker Desktop Kubernetes, `metrics-server`, Locust load generation, and a Python experiment collector.
+This project is a local Kubernetes autoscaling fault-injection testbed for TeaStore on Docker Desktop Kubernetes.
 
-The current implementation focuses on Horizontal Pod Autoscaling (HPA). It does not directly corrupt Kubernetes metrics inside the metrics-server pipeline. Instead, it runs real HPA experiments with clean Kubernetes metrics and uses the Python collector to simulate faulty CPU and memory metrics in CSV output. This gives you experimental data without requiring a Prometheus Adapter or a custom Kubernetes external metrics API server.
+The default experiment path is now:
+
+```text
+Locust -> TeaStore WebUI -> TeaStore backend services
+```
+
+That is the right direction for this project because real users interact with the WebUI, not the recommender directly.
+
+## What Changed
+
+The codebase now deploys a minimal full TeaStore stack:
+
+- `teastore-db`
+- `teastore-registry`
+- `teastore-persistence`
+- `teastore-auth`
+- `teastore-image`
+- `teastore-recommender`
+- `teastore-webui`
+
+Locust should target the WebUI.
+
+The default HPA experiment also targets the WebUI. Recommender-specific HPA manifests are still present for secondary experiments.
+
+The Python fault-injection collector now defaults to the WebUI deployment and label selector, but you can override both from the command line.
 
 ## What This Project Measures
 
 The main question is:
 
 ```text
-How would autoscaling behavior change if Kubernetes made scaling decisions from faulty CPU or memory telemetry?
+How would autoscaling behavior change if Kubernetes made scaling decisions from faulty CPU or memory telemetry while users interact through the TeaStore WebUI?
 ```
 
 You can measure:
@@ -19,9 +43,10 @@ You can measure:
 - Memory spike faults causing over-scaling.
 - Memory drop faults causing under-scaling.
 - Random faults causing unstable scaling estimates.
-- Differences between real HPA behavior and simulated faulty HPA behavior.
+- Random multiplier faults that multiply both CPU and memory by a random value between `0` and `100`.
+- Differences between clean-metric replica estimates and faulty-metric replica estimates.
 
-## Important Autoscaling Terms
+## Important Terms
 
 Horizontal scaling means changing the number of pods:
 
@@ -38,7 +63,7 @@ cpu request: 200m -> 500m
 memory request: 256Mi -> 512Mi
 ```
 
-This requires Vertical Pod Autoscaler (VPA), which is not installed or configured by this project yet.
+This requires Vertical Pod Autoscaler (VPA), which this project does not install yet.
 
 ## Current Architecture
 
@@ -46,17 +71,20 @@ This requires Vertical Pod Autoscaler (VPA), which is not installed or configure
 Locust load generator
         |
         v
-TeaStore recommender deployment
+TeaStore WebUI
+        |
+        v
+TeaStore backend services
         |
         v
 metrics-server reports CPU and memory
         |
-        +--> Kubernetes HPA scales pods from clean metrics
+        +--> Kubernetes HPA scales a chosen deployment from clean metrics
         |
         +--> Python collector simulates faulty metrics and writes CSV results
 ```
 
-The Python collector does not currently feed `faulty_cpu` or `faulty_memory` back into Kubernetes HPA. That would require an external metrics adapter.
+The collector does not inject corrupted metrics into the live Kubernetes metrics pipeline. It simulates faulty CPU and memory after reading real metrics and records what scaling decisions would have changed.
 
 ## Files That Matter
 
@@ -64,41 +92,49 @@ The Python collector does not currently feed `faulty_cpu` or `faulty_memory` bac
 k8s/teastore.yaml
 ```
 
-Creates the `teastore` namespace, deploys the TeaStore recommender, and exposes it with a service named `teastore-recommender`.
+Deploys the TeaStore namespace and the full app stack, including the WebUI service.
+
+```text
+k8s/webui-hpa.yaml
+```
+
+Default CPU-based HPA for the WebUI.
+
+```text
+k8s/webui-hpa-memory.yaml
+```
+
+Memory-based HPA for the WebUI.
 
 ```text
 k8s/recommender-hpa.yaml
 ```
 
-Creates the default CPU-based HPA. It targets 60% CPU utilization. Because the pod CPU request is `200m`, the approximate target average CPU is:
-
-```text
-200m * 0.60 = 120m
-```
+Optional CPU-based HPA for recommender-only experiments.
 
 ```text
 k8s/recommender-hpa-memory.yaml
 ```
 
-Alternative memory-based HPA. Use this instead of the CPU HPA when testing memory-based horizontal scaling. Do not run both HPA manifests against the same deployment at the same time.
+Optional memory-based HPA for recommender-only experiments.
 
 ```text
 fault-injection/metric_fault_injector.py
 ```
 
-Collects real pod CPU and memory from `kubectl top pods`, injects synthetic faults, estimates desired replica counts, and writes CSV rows.
+Collects real pod metrics, injects synthetic faults, estimates replica counts, and writes CSV results.
 
 ```text
 load/locustfile.py
 ```
 
-Generates load against the TeaStore web path.
+Generates HTTP load against the TeaStore WebUI path.
 
 ```text
 scripts/run_experiment.sh
 ```
 
-Applies the TeaStore deployment and default CPU HPA, waits briefly, then prints pod and HPA state.
+Deploys TeaStore and applies the default WebUI CPU HPA.
 
 ## Setup
 
@@ -140,15 +176,18 @@ Restart metrics-server:
 kubectl rollout restart deployment metrics-server -n kube-system
 ```
 
-Verify metrics:
+Verify the metrics API:
 
 ```sh
+kubectl top nodes
 kubectl top pods -n kube-system
 ```
 
+If `kubectl top` fails, do not continue with HPA experiments until metrics-server is healthy.
+
 ## Deploy The Workload
 
-Deploy TeaStore and the default CPU HPA:
+Deploy the TeaStore stack and the default WebUI CPU HPA:
 
 ```sh
 ./scripts/run_experiment.sh
@@ -158,7 +197,7 @@ Or manually:
 
 ```sh
 kubectl apply -f k8s/teastore.yaml
-kubectl apply -f k8s/recommender-hpa.yaml
+kubectl apply -f k8s/webui-hpa.yaml
 ```
 
 Check the objects:
@@ -169,10 +208,16 @@ kubectl get service -n teastore
 kubectl get hpa -n teastore
 ```
 
-Forward the TeaStore recommender service to your laptop:
+Forward the TeaStore WebUI service to your laptop:
 
 ```sh
-kubectl port-forward -n teastore service/teastore-recommender 8080:8080
+kubectl port-forward -n teastore service/teastore-webui 8080:8080
+```
+
+Open:
+
+```text
+http://localhost:8080/tools.descartes.teastore.webui/
 ```
 
 ## Generate Load
@@ -196,19 +241,22 @@ Use this Locust host:
 http://localhost:8080
 ```
 
-For repeatable experiments, use the same user count, spawn rate, and duration for every scenario.
-
-## Collect Fault-Injection Data
-
-The collector supports these scenarios:
+The Locust file already requests:
 
 ```text
-baseline
-cpu-spike
-cpu-drop
-memory-spike
-memory-drop
-random
+/tools.descartes.teastore.webui/
+```
+
+That means all benchmark traffic enters through the WebUI.
+
+## Default WebUI Experiment
+
+The default experiment scales the WebUI while sending requests to the WebUI.
+
+This is the cleanest end-to-end setup:
+
+```text
+Locust -> WebUI -> WebUI HPA -> fault-injection collector
 ```
 
 Run a baseline:
@@ -218,7 +266,7 @@ python fault-injection/metric_fault_injector.py collect \
   --scenario baseline \
   --duration 600 \
   --interval 15 \
-  --output results/baseline.csv
+  --output results/webui-baseline.csv
 ```
 
 Run a CPU spike experiment:
@@ -228,7 +276,7 @@ python fault-injection/metric_fault_injector.py collect \
   --scenario cpu-spike \
   --duration 600 \
   --interval 15 \
-  --output results/cpu-spike.csv
+  --output results/webui-cpu-spike.csv
 ```
 
 Run a CPU drop experiment:
@@ -238,7 +286,7 @@ python fault-injection/metric_fault_injector.py collect \
   --scenario cpu-drop \
   --duration 600 \
   --interval 15 \
-  --output results/cpu-drop.csv
+  --output results/webui-cpu-drop.csv
 ```
 
 Run a memory spike experiment:
@@ -248,7 +296,7 @@ python fault-injection/metric_fault_injector.py collect \
   --scenario memory-spike \
   --duration 600 \
   --interval 15 \
-  --output results/memory-spike.csv
+  --output results/webui-memory-spike.csv
 ```
 
 Run a memory drop experiment:
@@ -258,7 +306,7 @@ python fault-injection/metric_fault_injector.py collect \
   --scenario memory-drop \
   --duration 600 \
   --interval 15 \
-  --output results/memory-drop.csv
+  --output results/webui-memory-drop.csv
 ```
 
 Run random faults:
@@ -269,10 +317,70 @@ python fault-injection/metric_fault_injector.py collect \
   --fault-rate 0.2 \
   --duration 600 \
   --interval 15 \
-  --output results/random.csv
+  --output results/webui-random.csv
 ```
 
-The default CPU target is `120m`, matching the CPU HPA target of 60% of a `200m` request. The default memory target is `256Mi`.
+Run random multiplier faults:
+
+```sh
+python fault-injection/metric_fault_injector.py collect \
+  --scenario random-multiplier \
+  --duration 600 \
+  --interval 15 \
+  --output results/webui-random-multiplier.csv
+```
+
+In `random-multiplier`, the collector samples a random floating-point value from `0` to `100` on each interval and multiplies both CPU and memory by that value.
+
+## Switching The Collector Target
+
+The collector defaults to:
+
+```text
+deployment     = teastore-webui
+label selector = app=teastore-webui
+```
+
+To target recommender instead:
+
+```sh
+python fault-injection/metric_fault_injector.py collect \
+  --scenario cpu-spike \
+  --deployment teastore-recommender \
+  --label-selector app=teastore-recommender \
+  --duration 600 \
+  --interval 15 \
+  --output results/recommender-cpu-spike.csv
+```
+
+This lets you keep WebUI as the entry point while collecting metrics for another deployment.
+
+## Optional Recommender Experiment
+
+If you want user traffic to enter through the WebUI but want HPA to scale recommender instead:
+
+```sh
+kubectl delete hpa webui-hpa -n teastore
+kubectl apply -f k8s/recommender-hpa.yaml
+```
+
+Then collect recommender data:
+
+```sh
+python fault-injection/metric_fault_injector.py collect \
+  --scenario cpu-spike \
+  --deployment teastore-recommender \
+  --label-selector app=teastore-recommender \
+  --duration 600 \
+  --interval 15 \
+  --output results/recommender-cpu-spike.csv
+```
+
+That experiment path is:
+
+```text
+Locust -> WebUI -> recommender -> recommender HPA -> fault-injection collector
+```
 
 ## CSV Columns
 
@@ -281,6 +389,8 @@ Each CSV row includes:
 ```text
 timestamp
 scenario
+deployment
+label_selector
 fault_type
 pod_count
 current_replicas
@@ -307,108 +417,27 @@ If the faulty desired replica count is higher than the clean desired replica cou
 
 If the faulty desired replica count is lower than the clean desired replica count, the fault would cause under-scaling.
 
-## CPU HPA Experiment
-
-Use:
-
-```sh
-kubectl apply -f k8s/recommender-hpa.yaml
-```
-
-Watch HPA:
-
-```sh
-kubectl get hpa -n teastore -w
-```
-
-Watch pods:
-
-```sh
-kubectl get pods -n teastore -w
-```
-
-Collect data at the same time:
-
-```sh
-python fault-injection/metric_fault_injector.py collect \
-  --scenario cpu-spike \
-  --duration 600 \
-  --interval 15 \
-  --output results/cpu-hpa-spike.csv
-```
-
-Expected result:
-
-```text
-CPU spike faults should produce desired_replicas_cpu_faulty values higher than desired_replicas_cpu_clean.
-```
-
-Interpretation:
-
-```text
-If HPA had consumed the faulty CPU metric, it would have over-scaled.
-```
-
-## Memory HPA Experiment
-
-Remove the existing HPA first:
-
-```sh
-kubectl delete hpa recommender-hpa -n teastore
-```
-
-Apply the memory HPA:
-
-```sh
-kubectl apply -f k8s/recommender-hpa-memory.yaml
-```
-
-Collect memory fault data:
-
-```sh
-python fault-injection/metric_fault_injector.py collect \
-  --scenario memory-spike \
-  --duration 600 \
-  --interval 15 \
-  --output results/memory-hpa-spike.csv
-```
-
-Expected result:
-
-```text
-Memory spike faults should produce desired_replicas_memory_faulty values higher than desired_replicas_memory_clean.
-```
-
-Interpretation:
-
-```text
-If HPA had consumed the faulty memory metric, it would have over-scaled.
-```
-
 ## Suggested Experiment Matrix
 
-Run each scenario with the same Locust configuration:
+Use the same Locust user count, spawn rate, and duration for every scenario.
+
+Recommended matrix:
 
 ```text
-baseline
-cpu-spike
-cpu-drop
-memory-spike
-memory-drop
-random
-```
-
-For each run, record:
-
-```text
-Locust user count
-Locust spawn rate
-duration
-HPA type: CPU or memory
-minimum replicas
-maximum replicas
-target CPU or memory
-CSV output file
+WebUI HPA + baseline
+WebUI HPA + cpu-spike
+WebUI HPA + cpu-drop
+WebUI HPA + memory-spike
+WebUI HPA + memory-drop
+WebUI HPA + random
+WebUI HPA + random-multiplier
+Recommender HPA + baseline
+Recommender HPA + cpu-spike
+Recommender HPA + cpu-drop
+Recommender HPA + memory-spike
+Recommender HPA + memory-drop
+Recommender HPA + random
+Recommender HPA + random-multiplier
 ```
 
 ## Useful Result Metrics
@@ -455,22 +484,23 @@ A strong report can use these sections:
 
 ```text
 1. Objective
-2. Kubernetes setup
-3. Workload and autoscaling configuration
-4. Fault model
-5. Experiment matrix
-6. Results
-7. Analysis
-8. Limitations
-9. Future work
+2. TeaStore architecture
+3. Kubernetes deployment
+4. Workload generation through WebUI
+5. Fault model
+6. Experiment matrix
+7. Results
+8. Analysis
+9. Limitations
+10. Future work
 ```
 
-Important limitations to state clearly:
+Important limitations:
 
 ```text
 Faults are simulated after metrics collection.
 Faulty metrics are not injected into the live Kubernetes HPA control loop.
-The current project studies HPA, not full VPA.
+This project studies HPA, not full VPA.
 Docker Desktop Kubernetes is a local test environment, not a production cluster.
 ```
 
@@ -483,4 +513,3 @@ Configure HPA to consume those external metrics directly.
 Install VPA and compare HPA vs VPA under faulty metrics.
 Add graph generation scripts for CSV outputs.
 ```
-

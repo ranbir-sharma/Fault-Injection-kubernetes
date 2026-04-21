@@ -6,6 +6,272 @@ metadata:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
+  name: teastore-db
+  namespace: teastore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: teastore-db
+  template:
+    metadata:
+      labels:
+        app: teastore-db
+    spec:
+      containers:
+      - name: db
+        image: descartesresearch/teastore-db
+        ports:
+        - containerPort: 3306
+        readinessProbe:
+          tcpSocket:
+            port: 3306
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: "250m"
+            memory: "256Mi"
+          limits:
+            cpu: "500m"
+            memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teastore-db
+  namespace: teastore
+spec:
+  selector:
+    app: teastore-db
+  ports:
+  - name: mysql
+    port: 3306
+    targetPort: 3306
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teastore-registry
+  namespace: teastore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: teastore-registry
+  template:
+    metadata:
+      labels:
+        app: teastore-registry
+    spec:
+      containers:
+      - name: registry
+        image: descartesresearch/teastore-registry
+        env:
+        - name: HOST_NAME
+          value: teastore-registry
+        - name: SERVICE_PORT
+          value: "10000"
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: "200m"
+            memory: "256Mi"
+          limits:
+            cpu: "400m"
+            memory: "512Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teastore-registry
+  namespace: teastore
+spec:
+  selector:
+    app: teastore-registry
+  ports:
+  - name: http
+    port: 10000
+    targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teastore-persistence
+  namespace: teastore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: teastore-persistence
+  template:
+    metadata:
+      labels:
+        app: teastore-persistence
+    spec:
+      containers:
+      - name: persistence
+        image: descartesresearch/teastore-persistence
+        env:
+        - name: REGISTRY_HOST
+          value: teastore-registry
+        - name: REGISTRY_PORT
+          value: "10000"
+        - name: HOST_NAME
+          value: teastore-persistence
+        - name: SERVICE_PORT
+          value: "1111"
+        - name: DB_HOST
+          value: teastore-db
+        - name: DB_PORT
+          value: "3306"
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: "350m"
+            memory: "384Mi"
+          limits:
+            cpu: "800m"
+            memory: "1536Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teastore-persistence
+  namespace: teastore
+spec:
+  selector:
+    app: teastore-persistence
+  ports:
+  - name: http
+    port: 1111
+    targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teastore-auth
+  namespace: teastore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: teastore-auth
+  template:
+    metadata:
+      labels:
+        app: teastore-auth
+    spec:
+      containers:
+      - name: auth
+        image: descartesresearch/teastore-auth
+        env:
+        - name: REGISTRY_HOST
+          value: teastore-registry
+        - name: REGISTRY_PORT
+          value: "10000"
+        - name: HOST_NAME
+          value: teastore-auth
+        - name: SERVICE_PORT
+          value: "2222"
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: "300m"
+            memory: "384Mi"
+          limits:
+            cpu: "800m"
+            memory: "1280Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teastore-auth
+  namespace: teastore
+spec:
+  selector:
+    app: teastore-auth
+  ports:
+  - name: http
+    port: 2222
+    targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teastore-image
+  namespace: teastore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: teastore-image
+  template:
+    metadata:
+      labels:
+        app: teastore-image
+    spec:
+      containers:
+      - name: image
+        image: descartesresearch/teastore-image
+        env:
+        - name: REGISTRY_HOST
+          value: teastore-registry
+        - name: REGISTRY_PORT
+          value: "10000"
+        - name: HOST_NAME
+          value: teastore-image
+        - name: SERVICE_PORT
+          value: "4444"
+        ports:
+        - containerPort: 8080
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 5
+        resources:
+          requests:
+            cpu: "300m"
+            memory: "384Mi"
+          limits:
+            cpu: "800m"
+            memory: "1024Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teastore-image
+  namespace: teastore
+spec:
+  selector:
+    app: teastore-image
+  ports:
+  - name: http
+    port: 4444
+    targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
   name: teastore-recommender
   namespace: teastore
 spec:
@@ -21,15 +287,29 @@ spec:
       containers:
       - name: recommender
         image: descartesresearch/teastore-recommender
+        env:
+        - name: REGISTRY_HOST
+          value: teastore-registry
+        - name: REGISTRY_PORT
+          value: "10000"
+        - name: HOST_NAME
+          value: teastore-recommender
+        - name: SERVICE_PORT
+          value: "3333"
         ports:
         - containerPort: 8080
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 5
         resources:
           requests:
-            cpu: "200m"
-            memory: "256Mi"
+            cpu: "400m"
+            memory: "384Mi"
           limits:
-            cpu: "500m"
-            memory: "512Mi"
+            cpu: "1000m"
+            memory: "1024Mi"
 ---
 apiVersion: v1
 kind: Service
@@ -39,6 +319,70 @@ metadata:
 spec:
   selector:
     app: teastore-recommender
+  ports:
+  - name: http
+    port: 3333
+    targetPort: 8080
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: teastore-webui
+  namespace: teastore
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: teastore-webui
+  template:
+    metadata:
+      labels:
+        app: teastore-webui
+    spec:
+      containers:
+      - name: webui
+        image: descartesresearch/teastore-webui
+        env:
+        - name: REGISTRY_HOST
+          value: teastore-registry
+        - name: REGISTRY_PORT
+          value: "10000"
+        - name: HOST_NAME
+          value: teastore-webui
+        - name: SERVICE_PORT
+          value: "8080"
+        ports:
+        - containerPort: 8080
+        startupProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 18
+        readinessProbe:
+          tcpSocket:
+            port: 8080
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 6
+        resources:
+          requests:
+            cpu: "500m"
+            memory: "512Mi"
+          limits:
+            cpu: "1000m"
+            memory: "1536Mi"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: teastore-webui
+  namespace: teastore
+spec:
+  selector:
+    app: teastore-webui
   ports:
   - name: http
     port: 8080

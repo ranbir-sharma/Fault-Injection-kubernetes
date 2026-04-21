@@ -13,17 +13,19 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 
 NAMESPACE = "teastore"
-DEPLOYMENT = "teastore-recommender"
-LABEL_SELECTOR = "app=teastore-recommender"
+DEFAULT_DEPLOYMENT = "teastore-webui"
+DEFAULT_LABEL_SELECTOR = "app=teastore-webui"
 
 DEFAULT_MIN_REPLICAS = 1
-DEFAULT_MAX_REPLICAS = 10
-DEFAULT_TARGET_CPU_MILLICORES = 120.0
-DEFAULT_TARGET_MEMORY_MI = 256.0
+DEFAULT_MAX_REPLICAS = 1000
+DEFAULT_TARGET_CPU_MILLICORES = 300.0
+DEFAULT_TARGET_MEMORY_MI = 512.0
 
 CSV_FIELDS = [
     "timestamp",
     "scenario",
+    "deployment",
+    "label_selector",
     "fault_type",
     "pod_count",
     "current_replicas",
@@ -72,11 +74,11 @@ def parse_memory_mi(value):
     return float(value) / (1024 * 1024)
 
 
-def get_current_replicas():
+def get_current_replicas(args):
     output = run_kubectl([
         "get",
         "deployment",
-        DEPLOYMENT,
+        args.deployment,
         "-n",
         NAMESPACE,
         "-o",
@@ -85,14 +87,14 @@ def get_current_replicas():
     return int(output or "0")
 
 
-def get_pod_metrics():
+def get_pod_metrics(args):
     output = run_kubectl([
         "top",
         "pods",
         "-n",
         NAMESPACE,
         "-l",
-        LABEL_SELECTOR,
+        args.label_selector,
         "--no-headers",
     ])
 
@@ -109,7 +111,7 @@ def get_pod_metrics():
         })
 
     if not rows:
-        raise RuntimeError("No pod metrics found for teastore-recommender.")
+        raise RuntimeError(f"No pod metrics found for {args.label_selector}.")
 
     pod_count = len(rows)
     total_cpu_m = sum(row["cpu_m"] for row in rows)
@@ -128,6 +130,14 @@ def get_pod_metrics():
 def apply_fault(cpu_m, memory_mi, scenario, fault_rate):
     if scenario == "baseline":
         return cpu_m, memory_mi, "none"
+
+    if scenario == "random-multiplier":
+        multiplier = random.uniform(0.0, 100.0)
+        return (
+            cpu_m * multiplier,
+            memory_mi * multiplier,
+            f"random_multiplier_{multiplier:.3f}",
+        )
 
     if scenario == "random" and random.random() >= fault_rate:
         return cpu_m, memory_mi, "none"
@@ -161,8 +171,8 @@ def estimate_desired_replicas(current_replicas, observed_value, target_value, mi
 
 
 def collect_sample(args):
-    metrics = get_pod_metrics()
-    current_replicas = get_current_replicas()
+    metrics = get_pod_metrics(args)
+    current_replicas = get_current_replicas(args)
     real_cpu_m = metrics["avg_cpu_m"]
     real_memory_mi = metrics["avg_memory_mi"]
     faulty_cpu_m, faulty_memory_mi, fault_type = apply_fault(
@@ -175,6 +185,8 @@ def collect_sample(args):
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "scenario": args.scenario,
+        "deployment": args.deployment,
+        "label_selector": args.label_selector,
         "fault_type": fault_type,
         "pod_count": metrics["pod_count"],
         "current_replicas": current_replicas,
@@ -268,9 +280,12 @@ def build_parser():
                 "memory-spike",
                 "memory-drop",
                 "random",
+                "random-multiplier",
             ],
             default="random",
         )
+        subparser.add_argument("--deployment", default=DEFAULT_DEPLOYMENT)
+        subparser.add_argument("--label-selector", default=DEFAULT_LABEL_SELECTOR)
         subparser.add_argument("--fault-rate", type=float, default=0.2)
         subparser.add_argument("--target-cpu-m", type=float, default=DEFAULT_TARGET_CPU_MILLICORES)
         subparser.add_argument("--target-memory-mi", type=float, default=DEFAULT_TARGET_MEMORY_MI)
