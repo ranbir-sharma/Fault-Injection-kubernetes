@@ -2,8 +2,10 @@ import argparse
 import csv
 import math
 import random
+import statistics
 import subprocess
 import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -20,6 +22,10 @@ DEFAULT_MIN_REPLICAS = 1
 DEFAULT_MAX_REPLICAS = 1000
 DEFAULT_TARGET_CPU_MILLICORES = 300.0
 DEFAULT_TARGET_MEMORY_MI = 512.0
+
+# Mitigation filter defaults
+DEFAULT_WINDOW_SIZE = 5        # number of samples in the sliding window
+DEFAULT_ZSCORE_THRESHOLD = 2.0 # samples beyond this many std-devs are rejected
 
 # VPA simulation defaults
 # Safety margin approximates VPA's 90th-percentile histogram target with headroom
@@ -52,6 +58,17 @@ CSV_FIELDS = [
     "vpa_memory_rec_faulty_mi",
     "vpa_cpu_risk",
     "vpa_memory_risk",
+    # Mitigation columns — windowed median after z-score outlier rejection
+    "cpu_outlier_rejected",
+    "memory_outlier_rejected",
+    "effective_cpu_m",
+    "effective_memory_mi",
+    "desired_replicas_cpu_mitigated",
+    "desired_replicas_memory_mitigated",
+    "vpa_cpu_rec_mitigated_m",
+    "vpa_memory_rec_mitigated_mi",
+    "vpa_cpu_risk_mitigated",
+    "vpa_memory_risk_mitigated",
 ]
 
 
@@ -207,7 +224,67 @@ def vpa_risk(real_value, faulty_recommendation):
     return "accurate"
 
 
-def collect_sample(args):
+class MetricFilter:
+    """
+    Two-layer transient fault mitigation applied to the faulty metric stream:
+
+    Layer 1 — Z-score outlier rejection:
+        If the incoming sample deviates more than `zscore_threshold` standard
+        deviations from the current window mean, it is treated as a transient
+        fault and replaced with the rolling mean before being added to the window.
+
+    Layer 2 — Windowed median:
+        The effective metric value reported to HPA/VPA simulation is the median
+        of the last `window_size` accepted samples, which absorbs residual noise
+        that slipped past the z-score filter.
+    """
+
+    def __init__(self, window_size, zscore_threshold):
+        self.zscore_threshold = zscore_threshold
+        self._cpu: deque = deque(maxlen=window_size)
+        self._memory: deque = deque(maxlen=window_size)
+
+    def update(self, faulty_cpu_m, faulty_memory_mi):
+        """
+        Feed one faulty sample into the filter.
+        Returns (effective_cpu_m, effective_memory_mi, cpu_rejected, memory_rejected).
+        """
+        cpu_accepted, cpu_rejected = self._accept(faulty_cpu_m, self._cpu)
+        self._cpu.append(cpu_accepted)
+
+        mem_accepted, mem_rejected = self._accept(faulty_memory_mi, self._memory)
+        self._memory.append(mem_accepted)
+
+        return (
+            round(statistics.median(self._cpu), 3),
+            round(statistics.median(self._memory), 3),
+            cpu_rejected,
+            mem_rejected,
+        )
+
+    def _accept(self, value, window):
+        """Return (accepted_value, was_rejected). Rejected samples are replaced with the rolling mean."""
+        if len(window) < 2:
+            return value, False
+        mean = statistics.mean(window)
+        stdev = statistics.stdev(window)
+        if stdev > 0 and abs(value - mean) / stdev > self.zscore_threshold:
+            return mean, True
+        return value, False
+
+
+# Module-level filter used by the Flask serve handler (one persistent window per process).
+_serve_filter: MetricFilter | None = None
+
+
+def _get_serve_filter(args):
+    global _serve_filter
+    if _serve_filter is None:
+        _serve_filter = MetricFilter(args.window_size, args.zscore_threshold)
+    return _serve_filter
+
+
+def collect_sample(args, metric_filter):
     metrics = get_pod_metrics(args)
     current_replicas = get_current_replicas(args)
     real_cpu_m = metrics["avg_cpu_m"]
@@ -217,6 +294,10 @@ def collect_sample(args):
         real_memory_mi,
         args.scenario,
         args.fault_rate,
+    )
+
+    effective_cpu_m, effective_memory_mi, cpu_rejected, mem_rejected = metric_filter.update(
+        faulty_cpu_m, faulty_memory_mi,
     )
 
     return {
@@ -278,6 +359,37 @@ def collect_sample(args):
         "vpa_memory_risk": vpa_risk(real_memory_mi, estimate_vpa_recommendation(
             faulty_memory_mi, args.vpa_safety_margin, args.vpa_min_memory_mi, args.vpa_max_memory_mi,
         )),
+        # Mitigation outcomes — compare these against the faulty columns to measure effectiveness
+        "cpu_outlier_rejected": cpu_rejected,
+        "memory_outlier_rejected": mem_rejected,
+        "effective_cpu_m": effective_cpu_m,
+        "effective_memory_mi": effective_memory_mi,
+        "desired_replicas_cpu_mitigated": estimate_desired_replicas(
+            current_replicas,
+            effective_cpu_m,
+            args.target_cpu_m,
+            args.min_replicas,
+            args.max_replicas,
+        ),
+        "desired_replicas_memory_mitigated": estimate_desired_replicas(
+            current_replicas,
+            effective_memory_mi,
+            args.target_memory_mi,
+            args.min_replicas,
+            args.max_replicas,
+        ),
+        "vpa_cpu_rec_mitigated_m": estimate_vpa_recommendation(
+            effective_cpu_m, args.vpa_safety_margin, args.vpa_min_cpu_m, args.vpa_max_cpu_m,
+        ),
+        "vpa_memory_rec_mitigated_mi": estimate_vpa_recommendation(
+            effective_memory_mi, args.vpa_safety_margin, args.vpa_min_memory_mi, args.vpa_max_memory_mi,
+        ),
+        "vpa_cpu_risk_mitigated": vpa_risk(real_cpu_m, estimate_vpa_recommendation(
+            effective_cpu_m, args.vpa_safety_margin, args.vpa_min_cpu_m, args.vpa_max_cpu_m,
+        )),
+        "vpa_memory_risk_mitigated": vpa_risk(real_memory_mi, estimate_vpa_recommendation(
+            effective_memory_mi, args.vpa_safety_margin, args.vpa_min_memory_mi, args.vpa_max_memory_mi,
+        )),
     }
 
 
@@ -294,12 +406,13 @@ def append_csv(path, row):
 
 
 def collect_loop(args):
+    metric_filter = MetricFilter(args.window_size, args.zscore_threshold)
     deadline = None
     if args.duration > 0:
         deadline = time.monotonic() + args.duration
 
     while deadline is None or time.monotonic() < deadline:
-        row = collect_sample(args)
+        row = collect_sample(args, metric_filter)
         append_csv(args.output, row)
         print(row, flush=True)
         time.sleep(args.interval)
@@ -314,8 +427,7 @@ def metric():
         "--fault-rate",
         request.args.get("fault_rate", "0.2"),
     ])
-    row = collect_sample(args)
-
+    row = collect_sample(args, _get_serve_filter(args))
     return jsonify(row)
 
 
@@ -352,6 +464,8 @@ def build_parser():
         subparser.add_argument("--vpa-max-cpu-m", type=float, default=DEFAULT_VPA_MAX_CPU_M)
         subparser.add_argument("--vpa-min-memory-mi", type=float, default=DEFAULT_VPA_MIN_MEMORY_MI)
         subparser.add_argument("--vpa-max-memory-mi", type=float, default=DEFAULT_VPA_MAX_MEMORY_MI)
+        subparser.add_argument("--window-size", type=int, default=DEFAULT_WINDOW_SIZE)
+        subparser.add_argument("--zscore-threshold", type=float, default=DEFAULT_ZSCORE_THRESHOLD)
 
     collect_parser = subparsers.choices["collect"]
     collect_parser.add_argument("--interval", type=float, default=15.0)

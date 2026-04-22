@@ -28,6 +28,8 @@ The default HPA experiment also targets the WebUI. Recommender-specific HPA mani
 
 The Python fault-injection collector now defaults to the WebUI deployment and label selector, but you can override both from the command line.
 
+The collector also computes a mitigated path for every sample using a transient fault filter, so each run now records clean, faulty, and mitigated outcomes side by side.
+
 ## What This Project Measures
 
 The main question is:
@@ -44,7 +46,9 @@ You can measure:
 - Memory drop faults causing under-scaling.
 - Random faults causing unstable scaling estimates.
 - Random multiplier faults that multiply both CPU and memory by a random value between `0` and `100`.
-- Differences between clean-metric replica estimates and faulty-metric replica estimates.
+- Differences between clean, faulty, and mitigated replica estimates.
+- Differences between clean, faulty, and mitigated VPA recommendations.
+- Whether the mitigation filter recovers decisions toward the clean baseline.
 
 ## Important Terms
 
@@ -63,7 +67,9 @@ cpu request: 200m -> 500m
 memory request: 256Mi -> 512Mi
 ```
 
-This requires Vertical Pod Autoscaler (VPA), which this project does not install yet.
+This project simulates VPA recommendations in Python during every collector run.
+
+The repo also includes a Kubernetes `VerticalPodAutoscaler` manifest for recommender, but live VPA resources only work if VPA CRDs and controllers are installed in the cluster.
 
 ## Current Architecture
 
@@ -81,10 +87,10 @@ metrics-server reports CPU and memory
         |
         +--> Kubernetes HPA scales a chosen deployment from clean metrics
         |
-        +--> Python collector simulates faulty metrics and writes CSV results
+        +--> Python collector simulates faulty metrics, applies mitigation, and writes CSV results
 ```
 
-The collector does not inject corrupted metrics into the live Kubernetes metrics pipeline. It simulates faulty CPU and memory after reading real metrics and records what scaling decisions would have changed.
+The collector does not inject corrupted metrics into the live Kubernetes metrics pipeline. It reads real CPU and memory, simulates faulty values in Python, applies a mitigation filter, and records what HPA/VPA decisions would have changed under clean, faulty, and mitigated inputs.
 
 ## Files That Matter
 
@@ -122,7 +128,7 @@ Optional memory-based HPA for recommender-only experiments.
 fault-injection/metric_fault_injector.py
 ```
 
-Collects real pod metrics, injects synthetic faults, estimates replica counts, and writes CSV results.
+Collects real pod metrics, injects synthetic faults, estimates HPA replica counts, simulates VPA recommendations, applies mitigation filtering, and writes CSV results.
 
 ```text
 load/locustfile.py
@@ -355,6 +361,39 @@ python fault-injection/metric_fault_injector.py collect \
 
 In `random-multiplier`, the collector samples a random floating-point value from `0` to `100` on each interval and multiplies both CPU and memory by that value.
 
+## Mitigation Filter
+
+The collector includes a two-layer transient fault mitigation filter named `MetricFilter`.
+
+Layer 1: z-score outlier rejection
+
+- before a new faulty sample enters the sliding window, the filter compares it with the current rolling mean and standard deviation
+- if the sample is more than `zscore-threshold` standard deviations away, it is treated as a transient fault
+- rejected samples are replaced with the rolling mean
+
+Layer 2: windowed median
+
+- the effective metric value used for mitigated HPA/VPA simulation is the median of the last `window-size` accepted samples
+
+Default mitigation parameters:
+
+```text
+window-size = 5
+zscore-threshold = 2.0
+```
+
+Optional tuning:
+
+```sh
+python fault-injection/metric_fault_injector.py collect \
+  --scenario random-multiplier \
+  --window-size 5 \
+  --zscore-threshold 2.0 \
+  --duration 600 \
+  --interval 15 \
+  --output results/webui-random-multiplier.csv
+```
+
 ## Switching The Collector Target
 
 The collector defaults to:
@@ -425,20 +464,42 @@ desired_replicas_cpu_clean
 desired_replicas_cpu_faulty
 desired_replicas_memory_clean
 desired_replicas_memory_faulty
+vpa_cpu_rec_clean_m
+vpa_cpu_rec_faulty_m
+vpa_memory_rec_clean_mi
+vpa_memory_rec_faulty_mi
+vpa_cpu_risk
+vpa_memory_risk
+cpu_outlier_rejected
+memory_outlier_rejected
+effective_cpu_m
+effective_memory_mi
+desired_replicas_cpu_mitigated
+desired_replicas_memory_mitigated
+vpa_cpu_rec_mitigated_m
+vpa_memory_rec_mitigated_mi
+vpa_cpu_risk_mitigated
+vpa_memory_risk_mitigated
 ```
 
 The most important comparisons are:
 
 ```text
 desired_replicas_cpu_clean vs desired_replicas_cpu_faulty
+desired_replicas_cpu_clean vs desired_replicas_cpu_mitigated
 desired_replicas_memory_clean vs desired_replicas_memory_faulty
-current_replicas vs desired_replicas_cpu_faulty
-current_replicas vs desired_replicas_memory_faulty
+desired_replicas_memory_clean vs desired_replicas_memory_mitigated
+vpa_cpu_rec_clean_m vs vpa_cpu_rec_faulty_m vs vpa_cpu_rec_mitigated_m
+vpa_memory_rec_clean_mi vs vpa_memory_rec_faulty_mi vs vpa_memory_rec_mitigated_mi
+vpa_cpu_risk vs vpa_cpu_risk_mitigated
+vpa_memory_risk vs vpa_memory_risk_mitigated
 ```
 
 If the faulty desired replica count is higher than the clean desired replica count, the fault would cause over-scaling.
 
 If the faulty desired replica count is lower than the clean desired replica count, the fault would cause under-scaling.
+
+If the mitigated result moves back toward the clean result, the mitigation filter improved the decision quality.
 
 ## Suggested Experiment Matrix
 
@@ -523,7 +584,7 @@ Important limitations:
 ```text
 Faults are simulated after metrics collection.
 Faulty metrics are not injected into the live Kubernetes HPA control loop.
-This project studies HPA, not full VPA.
+Live Kubernetes VPA requires separate VPA CRDs and controllers in the cluster.
 Docker Desktop Kubernetes is a local test environment, not a production cluster.
 ```
 

@@ -70,6 +70,12 @@ Valid `--scenario` values: `baseline`, `cpu-spike`, `cpu-drop`, `memory-spike`, 
   --vpa-max-memory-mi 1024
 ```
 
+**Mitigation filter overrides** (optional):
+```bash
+  --window-size      5    # sliding window depth for windowed median
+  --zscore-threshold 2.0  # samples beyond this many std-devs are rejected
+```
+
 **Flask serve mode** (exposes `/metric` on port 5001 for external polling):
 ```bash
 python fault-injection/metric_fault_injector.py serve
@@ -154,10 +160,11 @@ Live VPA  (recommender-vpa.yaml: Off mode — recommends only)
 PARALLEL — Python collector (fault-injection/metric_fault_injector.py):
     ├── reads real metrics via `kubectl top pods`
     ├── applies fault multipliers to produce faulty metrics
-    ├── simulates HPA desired-replica count (clean + faulty)
-    ├── simulates VPA resource recommendation (clean + faulty)
+    ├── runs MetricFilter: z-score outlier rejection → windowed median → effective metrics
+    ├── simulates HPA desired-replica count (clean / faulty / mitigated)
+    ├── simulates VPA resource recommendation (clean / faulty / mitigated)
     ├── classifies VPA risk: under_provisioned / over_provisioned / accurate
-    └── writes 21-column CSV to results/
+    └── writes 31-column CSV to results/
 ```
 
 ### Fault Models
@@ -191,7 +198,7 @@ Risk classification written to `vpa_cpu_risk` / `vpa_memory_risk`:
 - `over_provisioned` — faulty rec > real usage × 1.5 → node capacity wasted, scheduling may fail
 - `accurate` — within normal headroom
 
-### CSV Output Schema (21 columns)
+### CSV Output Schema (31 columns)
 
 ```
 timestamp, scenario, deployment, label_selector, fault_type,
@@ -201,13 +208,20 @@ desired_replicas_cpu_clean, desired_replicas_cpu_faulty,
 desired_replicas_memory_clean, desired_replicas_memory_faulty,
 vpa_cpu_rec_clean_m, vpa_cpu_rec_faulty_m,
 vpa_memory_rec_clean_mi, vpa_memory_rec_faulty_mi,
-vpa_cpu_risk, vpa_memory_risk
+vpa_cpu_risk, vpa_memory_risk,
+cpu_outlier_rejected, memory_outlier_rejected,
+effective_cpu_m, effective_memory_mi,
+desired_replicas_cpu_mitigated, desired_replicas_memory_mitigated,
+vpa_cpu_rec_mitigated_m, vpa_memory_rec_mitigated_mi,
+vpa_cpu_risk_mitigated, vpa_memory_risk_mitigated
 ```
 
 Key comparisons:
 - `desired_replicas_*_clean` vs `desired_replicas_*_faulty` — HPA divergence under bad metrics
+- `desired_replicas_*_faulty` vs `desired_replicas_*_mitigated` — how much mitigation recovers toward clean
 - `vpa_*_rec_clean_*` vs `vpa_*_rec_faulty_*` — VPA resource inflation/deflation under bad metrics
-- `vpa_*_risk` — whether the fault causes a reliability or availability problem
+- `vpa_*_risk` vs `vpa_*_risk_mitigated` — whether mitigation resolves the reliability/availability risk
+- `cpu_outlier_rejected` / `memory_outlier_rejected` — which samples were caught by z-score filter
 
 ## Key Files
 
